@@ -43,6 +43,7 @@ pub struct Pump {
 }
 
 impl Pump {
+    /// Creates a new Pump instance with the provided RPC clients and keypair
     pub fn new(
         rpc_nonblocking_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
         rpc_client: Arc<solana_client::rpc_client::RpcClient>,
@@ -55,42 +56,209 @@ impl Pump {
         }
     }
 
+    /// Executes a token swap on PumpFun with the specified parameters
     pub async fn swap(
         &self,
         mint: &str,
         amount_in: u64,
         swap_direction: SwapDirection,
-        slippage: u64,
+        slippage_bps: u64,
         jito_client: Arc<JitoRpcClient>,
         timestamp: Instant,
     ) -> Result<Vec<String>> {
-        // make instruction on pumpfun
-
+        // Input validation
+        self.validate_swap_params(mint, amount_in, slippage_bps)?;
+        
+        // Get the appropriate RPC client
+        let client = self.get_rpc_client()?;
+        
+        // Build swap instructions based on direction and parameters
+        let instructions = self.build_swap_instructions(
+            mint,
+            amount_in,
+            swap_direction,
+            slippage_bps,
+        ).await?;
+        
+        // Execute the transaction
         tx::new_signed_and_send(
             &client,
             &self.keypair,
             instructions,
-            jito_client.clone(),
-            timestamp.clone(),
+            jito_client,
+            timestamp,
         )
         .await
+        .context("Failed to execute swap transaction")
+    }
+
+    /// Validates swap parameters to ensure they are within acceptable ranges
+    fn validate_swap_params(
+        &self,
+        mint: &str,
+        amount_in: u64,
+        slippage_bps: u64,
+    ) -> Result<()> {
+        // Validate mint address format
+        Pubkey::from_str(mint)
+            .context("Invalid mint address format")?;
+        
+        // Validate amount is not zero
+        if amount_in == 0 {
+            return Err(anyhow!("Swap amount cannot be zero"));
+        }
+        
+        // Validate slippage is reasonable (max 50% = 5000 bps)
+        if slippage_bps > 5000 {
+            return Err(anyhow!("Slippage tolerance too high: {}bps (max: 5000bps)", slippage_bps));
+        }
+        
+        Ok(())
+    }
+
+    /// Gets the blocking RPC client, returning an error if not available
+    fn get_rpc_client(&self) -> Result<&Arc<solana_client::rpc_client::RpcClient>> {
+        self.rpc_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("Blocking RPC client not available"))
+    }
+
+    /// Builds the necessary instructions for the swap transaction
+    async fn build_swap_instructions(
+        &self,
+        mint: &str,
+        amount_in: u64,
+        swap_direction: SwapDirection,
+        slippage_bps: u64,
+    ) -> Result<Vec<Instruction>> {
+        let mint_pubkey = Pubkey::from_str(mint)?;
+        
+        // Get bonding curve information
+        let pump_program = Pubkey::from_str(PUMP_PROGRAM)?;
+        let (bonding_curve, associated_bonding_curve, bonding_curve_account) = 
+            get_bonding_curve_account(
+                self.rpc_client.as_ref().unwrap().clone(),
+                &mint_pubkey,
+                &pump_program,
+            ).await?;
+
+        // Calculate amounts based on swap direction and slippage
+        let (min_amount_out, max_amount_in) = self.calculate_swap_amounts(
+            amount_in,
+            slippage_bps,
+            &swap_direction,
+            &bonding_curve_account,
+        )?;
+
+        // Build instructions based on swap direction
+        match swap_direction {
+            SwapDirection::Buy => {
+                self.build_buy_instructions(
+                    &mint_pubkey,
+                    amount_in,
+                    min_amount_out,
+                    &bonding_curve,
+                    &associated_bonding_curve,
+                ).await
+            }
+            SwapDirection::Sell => {
+                self.build_sell_instructions(
+                    &mint_pubkey,
+                    amount_in,
+                    min_amount_out,
+                    &bonding_curve,
+                    &associated_bonding_curve,
+                ).await
+            }
+        }
+    }
+
+    /// Calculates the appropriate amounts for the swap based on slippage tolerance
+    fn calculate_swap_amounts(
+        &self,
+        amount_in: u64,
+        slippage_bps: u64,
+        swap_direction: &SwapDirection,
+        bonding_curve_account: &BondingCurveAccount,
+    ) -> Result<(u64, u64)> {
+        match swap_direction {
+            SwapDirection::Buy => {
+                // For buys: calculate minimum tokens to receive
+                let min_tokens_out = min_amount_with_slippage(amount_in, slippage_bps)?;
+                let max_sol_in = max_amount_with_slippage(amount_in, slippage_bps)?;
+                Ok((min_tokens_out, max_sol_in))
+            }
+            SwapDirection::Sell => {
+                // For sells: calculate minimum SOL to receive
+                let min_sol_out = min_amount_with_slippage(amount_in, slippage_bps)?;
+                Ok((min_sol_out, amount_in))
+            }
+        }
+    }
+
+    /// Builds instructions for buying tokens
+    async fn build_buy_instructions(
+        &self,
+        mint: &Pubkey,
+        sol_amount: u64,
+        min_tokens_out: u64,
+        bonding_curve: &Pubkey,
+        associated_bonding_curve: &Pubkey,
+    ) -> Result<Vec<Instruction>> {
+        // Implementation for buy instructions
+        // This would include creating associated token accounts if needed,
+        // and building the actual pump.fun buy instruction
+        todo!("Implement buy instruction building")
+    }
+
+    /// Builds instructions for selling tokens
+    async fn build_sell_instructions(
+        &self,
+        mint: &Pubkey,
+        token_amount: u64,
+        min_sol_out: u64,
+        bonding_curve: &Pubkey,
+        associated_bonding_curve: &Pubkey,
+    ) -> Result<Vec<Instruction>> {
+        // Implementation for sell instructions
+        // This would include building the actual pump.fun sell instruction
+        todo!("Implement sell instruction building")
     }
 }
 
-fn min_amount_with_slippage(input_amount: u64, slippage_bps: u64) -> u64 {
+fn min_amount_with_slippage(input_amount: u64, slippage_bps: u64) -> Result<u64, &'static str> {
+    // Validate slippage is not greater than 100% (10,000 basis points)
+    if slippage_bps >= TEN_THOUSAND {
+        return Err("Slippage cannot be 100% or greater");
+    }
+    
+    // Calculate the percentage to keep (more efficient single calculation)
+    let keep_percentage = TEN_THOUSAND - slippage_bps;
+    
+    // Perform the calculation with proper error handling
     input_amount
-        .checked_mul(TEN_THOUSAND.checked_sub(slippage_bps).unwrap())
-        .unwrap()
-        .checked_div(TEN_THOUSAND)
-        .unwrap()
+        .checked_mul(keep_percentage)
+        .and_then(|result| result.checked_div(TEN_THOUSAND))
+        .ok_or("Arithmetic overflow in slippage calculation")
 }
-fn max_amount_with_slippage(input_amount: u64, slippage_bps: u64) -> u64 {
+fn max_amount_with_slippage(input_amount: u64, slippage_bps: u64) -> Result<u64, &'static str> {
+    // Validate slippage to prevent unreasonable values (e.g., > 10000 bps = 100%)
+    if slippage_bps > TEN_THOUSAND {
+        return Err("Slippage exceeds 100%, which may indicate an error");
+    }
+    
+    // Calculate the multiplier percentage (100% + slippage)
+    let multiplier_percentage = TEN_THOUSAND
+        .checked_add(slippage_bps)
+        .ok_or("Overflow when adding slippage to base percentage")?;
+    
+    // Perform the calculation with proper error handling
     input_amount
-        .checked_mul(slippage_bps.checked_add(TEN_THOUSAND).unwrap())
-        .unwrap()
-        .checked_div(TEN_THOUSAND)
-        .unwrap()
+        .checked_mul(multiplier_percentage)
+        .and_then(|result| result.checked_div(TEN_THOUSAND))
+        .ok_or("Arithmetic overflow in slippage calculation")
 }
+
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RaydiumInfo {
     pub base: f64,
