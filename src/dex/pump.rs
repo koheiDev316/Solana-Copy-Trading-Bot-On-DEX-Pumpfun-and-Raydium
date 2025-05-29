@@ -19,6 +19,8 @@ use solana_sdk::{
     signature::Keypair,
     signer::Signer,
     system_program,
+    commitment_config::CommitmentConfig,
+    account::Account,
 };
 use spl_associated_token_account::{
     get_associated_token_address, instruction::create_associated_token_account_idempotent,
@@ -35,6 +37,10 @@ pub const PUMP_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 pub const PUMP_ACCOUNT: &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1";
 pub const PUMP_BUY_METHOD: u64 = 16927863322537952870;
 pub const PUMP_SELL_METHOD: u64 = 12502976635542562355;
+// Additional constants
+pub const MIN_SOL_BALANCE: u64 = 5000000; // 0.005 SOL minimum
+pub const MAX_SLIPPAGE_BPS: u64 = 5000; // 50% max slippage
+pub const DEFAULT_SLIPPAGE_BPS: u64 = 100; // 1% default slippage
 
 pub struct Pump {
     pub rpc_nonblocking_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
@@ -53,6 +59,18 @@ impl Pump {
             rpc_nonblocking_client,
             keypair,
             rpc_client: Some(rpc_client),
+        }
+    }
+
+    /// Creates a new Pump instance with only non-blocking client
+    pub fn new_nonblocking(
+        rpc_nonblocking_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+        keypair: Arc<Keypair>,
+    ) -> Self {
+        Self {
+            rpc_nonblocking_client,
+            keypair,
+            rpc_client: None,
         }
     }
 
@@ -224,6 +242,35 @@ impl Pump {
         // This would include building the actual pump.fun sell instruction
         todo!("Implement sell instruction building")
     }
+
+    /// Gets current token price from bonding curve
+    pub async fn get_token_price(&self, mint: &str) -> Result<f64>
+
+    /// Calculates the expected output amount for a given input
+    pub async fn calculate_output_amount(
+        &self,
+        mint: &str,
+        amount_in: u64,
+        swap_direction: SwapDirection,
+    ) -> Result<u64>
+
+    /// Gets the user's SOL balance
+    pub async fn get_sol_balance(&self) -> Result<u64>
+
+    /// Gets the user's token balance for a specific mint
+    pub async fn get_token_balance(&self, mint: &str) -> Result<u64>
+
+    /// Checks if a token has graduated to Raydium
+    pub async fn is_token_graduated(&self, mint: &str) -> Result<bool>
+
+    /// Gets comprehensive token information
+    pub async fn get_token_info(&self, mint: &str) -> Result<TokenInfo>
+
+    /// Estimates transaction fees for a swap
+    pub async fn estimate_swap_fees(&self, mint: &str, swap_direction: SwapDirection) -> Result<SwapFees>
+
+    /// Checks if wallet has sufficient balance for the swap
+    async fn check_wallet_balance(&self, swap_direction: &SwapDirection, amount: u64) -> Result<()>
 }
 
 fn min_amount_with_slippage(input_amount: u64, slippage_bps: u64) -> Result<u64, &'static str> {
@@ -312,4 +359,23 @@ pub async fn get_pump_info(
     mint: &str,
 ) -> Result<PumpInfo> {
     Ok(pump_info)
+}
+
+// These would need to be added to support the new functions:
+pub struct TokenInfo {
+    pub mint: String,
+    pub price: f64,
+    pub user_balance: u64,
+    pub virtual_sol_reserves: u64,
+    pub virtual_token_reserves: u64,
+    pub total_supply: u64,
+    pub is_graduated: bool,
+    pub market_cap: f64,
+}
+
+pub struct SwapFees {
+    pub base_transaction_fee: u64,
+    pub platform_fee_bps: u64,
+    pub token_account_creation_fee: u64,
+    pub total_estimated_fee: u64,
 }
