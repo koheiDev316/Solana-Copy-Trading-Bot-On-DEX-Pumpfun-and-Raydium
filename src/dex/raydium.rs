@@ -119,6 +119,210 @@ impl Raydium {
         )
         .await
     }
+
+    // Function to get current token price from a pool
+    pub async fn get_token_price(
+        &self,
+        mint_address: &str,
+        pool_id: Option<&str>,
+    ) -> Result<f64> {
+        let (_, amm_info) = get_pool_state(
+            self.rpc_client.clone().unwrap(),
+            pool_id,
+            Some(mint_address),
+        ).await?;
+        
+        // Calculate price based on pool reserves
+        let coin_decimals = amm_info.coin_decimals as u32;
+        let pc_decimals = amm_info.pc_decimals as u32;
+        
+        let coin_amount = amount_to_ui_amount(amm_info.pool_coin_amount, coin_decimals);
+        let pc_amount = amount_to_ui_amount(amm_info.pool_pc_amount, pc_decimals);
+        
+        if coin_amount > 0.0 {
+            Ok(pc_amount / coin_amount)
+        } else {
+            Err(anyhow!("Invalid pool reserves"))
+        }
+    }
+
+    // Function to calculate swap output amount before executing
+    pub async fn calculate_swap_output(
+        &self,
+        mint_in: &str,
+        mint_out: &str,
+        amount_in: u64,
+        pool_id: Option<String>,
+    ) -> Result<u64> {
+        let pool_id_str = pool_id.as_deref();
+        let (amm_pool_id, amm_info) = get_pool_state(
+            self.rpc_client.clone().unwrap(),
+            pool_id_str,
+            Some(mint_in),
+        ).await?;
+
+        // Use Raydium's AMM formula to calculate output
+        let result = amm_cli::amm_swap_info(
+            &amm_pool_id,
+            &amm_info,
+            amount_in,
+            true, // swap_base_in
+        )?;
+        
+        Ok(result.other_amount_threshold)
+    }
+
+    // Function to monitor pool liquidity changes
+    pub async fn monitor_pool_liquidity(
+        &self,
+        pool_id: &str,
+        check_interval_seconds: u64,
+        callback: impl Fn(f64, f64) -> bool,
+    ) -> Result<()> {
+        let mut previous_liquidity = 0.0;
+        
+        loop {
+            let (_, amm_info) = get_pool_state(
+                self.rpc_client.clone().unwrap(),
+                Some(pool_id),
+                None,
+            ).await?;
+            
+            let coin_amount = amount_to_ui_amount(
+                amm_info.pool_coin_amount, 
+                amm_info.coin_decimals as u32
+            );
+            let pc_amount = amount_to_ui_amount(
+                amm_info.pool_pc_amount, 
+                amm_info.pc_decimals as u32
+            );
+            
+            let total_liquidity = coin_amount + pc_amount;
+            
+            // Call the callback function with current and previous liquidity
+            if !callback(total_liquidity, previous_liquidity) {
+                break; // Stop monitoring if callback returns false
+            }
+            
+            previous_liquidity = total_liquidity;
+            sleep(Duration::from_secs(check_interval_seconds)).await;
+        }
+        
+        Ok(())
+    }
+
+    // Function to get user's token balance
+    pub async fn get_user_token_balance(&self, mint_address: &str) -> Result<u64> {
+        let mint_pubkey = Pubkey::from_str(mint_address)?;
+        let user_token_account = get_associated_token_address(
+            &self.keypair.pubkey(),
+            &mint_pubkey,
+        );
+        
+        match get_account_info(&self.rpc_nonblocking_client, &user_token_account).await {
+            Ok(account_info) => {
+                let token_account = Account::unpack(&account_info.data)?;
+                Ok(token_account.amount)
+            }
+            Err(_) => Ok(0), // Account doesn't exist, balance is 0
+        }
+    }
+
+    // Function to create token account if it doesn't exist
+    pub async fn ensure_token_account(&self, mint_address: &str) -> Result<Pubkey> {
+        let mint_pubkey = Pubkey::from_str(mint_address)?;
+        let user_token_account = get_associated_token_address(
+            &self.keypair.pubkey(),
+            &mint_pubkey,
+        );
+        
+        // Check if account exists
+        if get_account_info(&self.rpc_nonblocking_client, &user_token_account).await.is_err() {
+            // Create the account
+            let create_instruction = create_associated_token_account_idempotent(
+                &self.keypair.pubkey(),
+                &self.keypair.pubkey(),
+                &mint_pubkey,
+                &spl_token::id(),
+            );
+            
+            // Send transaction to create account
+            let instructions = vec![create_instruction];
+            tx::new_signed_and_send(
+                &self.rpc_client.clone().unwrap(),
+                &self.keypair,
+                instructions,
+                // Note: You'll need to handle jito_client parameter based on your needs
+                Arc::new(JitoRpcClient::new("your_jito_endpoint".to_string())?),
+                Instant::now(),
+            ).await?;
+        }
+        
+        Ok(user_token_account)
+    }
+
+    // Function to get multiple pool states at once
+    pub async fn get_multiple_pool_states(
+        &self,
+        pool_ids: Vec<&str>,
+    ) -> Result<HashMap<String, AmmInfo>> {
+        let mut pool_states = HashMap::new();
+        
+        for pool_id in pool_ids {
+            match get_pool_state(
+                self.rpc_client.clone().unwrap(),
+                Some(pool_id),
+                None,
+            ).await {
+                Ok((_, amm_info)) => {
+                    pool_states.insert(pool_id.to_string(), amm_info);
+                }
+                Err(e) => {
+                    eprintln!("Failed to get pool state for {}: {}", pool_id, e);
+                }
+            }
+        }
+        
+        Ok(pool_states)
+    }
+
+    // Function to validate if a swap is profitable
+    pub async fn is_swap_profitable(
+        &self,
+        mint_in: &str,
+        mint_out: &str,
+        amount_in: u64,
+        minimum_profit_percentage: f64,
+    ) -> Result<bool> {
+        let output_amount = self.calculate_swap_output(
+            mint_in,
+            mint_out,
+            amount_in,
+            None,
+        ).await?;
+        
+        // Calculate reverse swap to see if we can get back more than we started with
+        let reverse_output = self.calculate_swap_output(
+            mint_out,
+            mint_in,
+            output_amount,
+            None,
+        ).await?;
+        
+        let profit_percentage = ((reverse_output as f64 - amount_in as f64) / amount_in as f64) * 100.0;
+        
+        Ok(profit_percentage >= minimum_profit_percentage)
+    }
+
+    // Function to set a new pool ID for future operations
+    pub fn set_pool_id(&mut self, pool_id: String) {
+        self.pool_id = Some(pool_id);
+    }
+
+    // Function to get current pool ID
+    pub fn get_pool_id(&self) -> Option<&String> {
+        self.pool_id.as_ref()
+    }
 }
 pub fn amm_swap(
     amm_program: &Pubkey,
