@@ -246,13 +246,14 @@ impl Pump {
     /// Gets current token price from bonding curve
     pub async fn get_token_price(&self, mint: &str) -> Result<f64>
 
-    /// Calculates the expected output amount for a given input
-    pub async fn calculate_output_amount(
-        &self,
-        mint: &str,
-        amount_in: u64,
-        swap_direction: SwapDirection,
-    ) -> Result<u64>
+    /// Checks if a token has graduated to Raydium
+    pub async fn is_token_graduated(&self, mint: &str) -> Result<bool>
+
+    /// Gets comprehensive token information
+    pub async fn get_token_info(&self, mint: &str) -> Result<TokenInfo>
+
+    /// Estimates transaction fees for a swap
+    pub async fn estimate_swap_fees(&self, mint: &str, swap_direction: SwapDirection) -> Result<SwapFees>
 
     /// Gets the user's SOL balance
     pub async fn get_sol_balance(&self) -> Result<u64>
@@ -378,4 +379,214 @@ pub struct SwapFees {
     pub platform_fee_bps: u64,
     pub token_account_creation_fee: u64,
     pub total_estimated_fee: u64,
+}
+
+use tracing::{info, warn, error};
+use std::time::Instant;
+
+use anyhow::{anyhow, Result};
+use std::sync::Arc;
+use tokio::time::Instant;
+use jito_json_rpc_client::jsonrpc_client::rpc_client::RpcClient as JitoRpcClient;
+
+/// Executes a pump swap with improved error handling and validation
+pub async fn pump_swap(
+    state: AppState,
+    amount_in: u64,
+    swap_direction: &str,
+    slippage: u64,
+    mint: &str,
+    jito_client: Arc<JitoRpcClient>,
+    timestamp: Instant,
+) -> Result<Vec<String>> {
+    // Parse and validate swap direction
+    let swap_direction = parse_swap_direction(swap_direction)?;
+    
+    // Validate inputs early
+    validate_pump_swap_inputs(amount_in, slippage, mint)?;
+    
+    // Create Pump instance (reuse if possible in production)
+    let pump = Pump::new(
+        state.rpc_nonblocking_client,
+        state.rpc_client,
+        state.wallet,
+    );
+    
+    // Log timing information
+    println!("Pump swap initiated after: {:.2?}", timestamp.elapsed());
+    
+    // Execute swap with proper error propagation
+    pump.swap(
+        mint,
+        amount_in,
+        swap_direction,
+        slippage,
+        jito_client,
+        timestamp,
+    )
+    .await
+    .map_err(|e| anyhow!("Pump swap failed: {}", e))
+}
+
+/// Enhanced version with additional features
+pub async fn pump_swap_enhanced(
+    state: AppState,
+    amount_in: u64,
+    swap_direction: &str,
+    slippage: Option<u64>,
+    mint: &str,
+    jito_client: Arc<JitoRpcClient>,
+    timestamp: Instant,
+) -> Result<PumpSwapResult> {
+    // Parse swap direction
+    let swap_direction = parse_swap_direction(swap_direction)?;
+    
+    // Use default slippage if not provided
+    let slippage = slippage.unwrap_or(DEFAULT_SLIPPAGE_BPS);
+    
+    // Validate inputs
+    validate_pump_swap_inputs(amount_in, slippage, mint)?;
+    
+    // Create Pump instance
+    let pump = Pump::new(
+        state.rpc_nonblocking_client,
+        state.rpc_client,
+        state.wallet,
+    );
+    
+    // Pre-swap validation
+    pump.check_wallet_balance(&swap_direction, amount_in).await?;
+    
+    // Get price before swap for comparison
+    let price_before = pump.get_token_price(mint).await.ok();
+    
+    // Estimate fees
+    let estimated_fees = pump.estimate_swap_fees(mint, swap_direction).await?;
+    
+    println!("Executing swap - Elapsed: {:.2?}, Estimated fees: {} lamports", 
+             timestamp.elapsed(), estimated_fees.total_estimated_fee);
+    
+    // Execute the swap
+    let transaction_signatures = pump.swap(
+        mint,
+        amount_in,
+        swap_direction,
+        slippage,
+        jito_client,
+        timestamp,
+    ).await?;
+    
+    // Get price after swap (optional, for analytics)
+    let price_after = pump.get_token_price(mint).await.ok();
+    
+    Ok(PumpSwapResult {
+        transaction_signatures,
+        estimated_fees,
+        price_before,
+        price_after,
+        execution_time: timestamp.elapsed(),
+    })
+}
+
+/// Simplified swap function with sensible defaults
+pub async fn pump_swap_simple(
+    state: AppState,
+    amount_in: u64,
+    swap_direction: &str,
+    mint: &str,
+    jito_client: Arc<JitoRpcClient>,
+) -> Result<Vec<String>> {
+    let swap_direction = parse_swap_direction(swap_direction)?;
+    
+    let pump = Pump::new(
+        state.rpc_nonblocking_client,
+        state.rpc_client,
+        state.wallet,
+    );
+    
+    // Use appropriate method based on direction
+    match swap_direction {
+        SwapDirection::Buy => pump.buy_token(mint, amount_in, jito_client).await,
+        SwapDirection::Sell => pump.sell_token(mint, amount_in, jito_client).await,
+    }
+}
+
+/// Parses string swap direction into enum
+fn parse_swap_direction(direction: &str) -> Result<SwapDirection> {
+    match direction.to_lowercase().as_str() {
+        "buy" | "b" => Ok(SwapDirection::Buy),
+        "sell" | "s" => Ok(SwapDirection::Sell),
+        _ => Err(anyhow!("Invalid swap direction: '{}'. Use 'buy' or 'sell'", direction)),
+    }
+}
+
+/// Validates pump swap input parameters
+fn validate_pump_swap_inputs(amount_in: u64, slippage: u64, mint: &str) -> Result<()> {
+    // Validate amount
+    if amount_in == 0 {
+        return Err(anyhow!("Amount cannot be zero"));
+    }
+    
+    // Validate slippage
+    if slippage > MAX_SLIPPAGE_BPS {
+        return Err(anyhow!("Slippage too high: {}bps (max: {}bps)", 
+                          slippage, MAX_SLIPPAGE_BPS));
+    }
+    
+    // Validate mint address
+    Pubkey::from_str(mint)
+        .map_err(|_| anyhow!("Invalid mint address: {}", mint))?;
+    
+    Ok(())
+}
+
+/// Result structure for enhanced swap function
+#[derive(Debug)]
+pub struct PumpSwapResult {
+    pub transaction_signatures: Vec<String>,
+    pub estimated_fees: SwapFees,
+    pub price_before: Option<f64>,
+    pub price_after: Option<f64>,
+    pub execution_time: std::time::Duration,
+}
+
+/// Batch swap function for multiple tokens
+pub async fn pump_swap_batch(
+    state: AppState,
+    swaps: Vec<SwapRequest>,
+    jito_client: Arc<JitoRpcClient>,
+) -> Result<Vec<Result<Vec<String>>>> {
+    let pump = Pump::new(
+        state.rpc_nonblocking_client,
+        state.rpc_client,
+        state.wallet,
+    );
+    
+    let mut results = Vec::new();
+    
+    for swap_request in swaps {
+        let swap_direction = parse_swap_direction(&swap_request.direction)?;
+        
+        let result = pump.swap(
+            &swap_request.mint,
+            swap_request.amount,
+            swap_direction,
+            swap_request.slippage.unwrap_or(DEFAULT_SLIPPAGE_BPS),
+            jito_client.clone(),
+            Instant::now(),
+        ).await;
+        
+        results.push(result);
+    }
+    
+    Ok(results)
+}
+
+/// Request structure for batch swaps
+#[derive(Debug, Clone)]
+pub struct SwapRequest {
+    pub mint: String,
+    pub amount: u64,
+    pub direction: String,
+    pub slippage: Option<u64>,
 }
