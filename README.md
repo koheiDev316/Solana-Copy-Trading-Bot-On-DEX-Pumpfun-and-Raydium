@@ -62,12 +62,6 @@ cargo run
 
 ---
 
-## 💬 **Need Help? Contact Me!**
-
-If you have any questions, feel free to reach out via:
-
-📩 **Telegram:** [@bitfancy](https://t.me/bitfancy)  
-🎮 **Discord:** [@bitbanana717]
 
 🌹 **You're always welcome!** 🌹
 
