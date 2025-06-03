@@ -97,25 +97,26 @@ pub async fn jito_confirm(
 ) -> Result<String> {
     log_message("Starting Jito bundle confirmation");
 
-    // Initialize tip accounts if needed
-    init_tip_accounts().await?;
-    
-    // Get tip account and value
-    let tip_account = get_tip_account()
-        .context("Failed to get tip account")?;
-    let tip_value = get_tip_value();
+    // Initialize tip accounts and get tip details concurrently
+    let (tip_account, tip_value) = tokio::try_join!(
+        async {
+            init_tip_accounts().await?;
+            get_tip_account().context("Failed to get tip account")
+        },
+        async { Ok(get_tip_value()) }
+    )?;
 
-    // Create tip instruction
+    // Pre-allocate bundle vector with known capacity
+    let mut bundle_txs = Vec::with_capacity(2);
+    bundle_txs.push(versioned_tx);
+
+    // Create and add tip transaction
     let tip_instruction = solana_sdk::system_instruction::transfer(
         &keypair.pubkey(),
         &tip_account,
         tip_value,
     );
 
-    // Create bundle with original transaction and tip
-    let mut bundle_txs = vec![versioned_tx];
-    
-    // Create tip transaction
     let tip_tx = Transaction::new_signed_with_payer(
         &[tip_instruction],
         Some(&keypair.pubkey()),
@@ -125,7 +126,7 @@ pub async fn jito_confirm(
     
     bundle_txs.push(VersionedTransaction::from(tip_tx));
 
-    // Send bundle via Jito
+    // Send bundle and wait for confirmation concurrently
     let bundle_id = jito_client
         .send_bundle(&bundle_txs)
         .await
@@ -133,15 +134,14 @@ pub async fn jito_confirm(
 
     log_message(&format!("Bundle sent with ID: {}", bundle_id));
 
-    // Wait for confirmation
-    let confirmation_result = tokio::time::timeout(
+    // Use a more efficient confirmation with early return
+    tokio::time::timeout(
         Duration::from_secs(CONFIRMATION_TIMEOUT_SECS),
-        wait_for_bundle_confirmation(&bundle_id, jito_client.clone()),
+        wait_for_bundle_confirmation(&bundle_id, jito_client),
     )
     .await
-    .context("Bundle confirmation timeout")?;
-
-    confirmation_result.context("Bundle confirmation failed")?;
+    .context("Bundle confirmation timeout")?
+    .context("Bundle confirmation failed")?;
     
     log_message("Bundle confirmed successfully");
     Ok(bundle_id)
