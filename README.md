@@ -23,6 +23,42 @@ This project is organized into several distinct modules, each responsible for a 
 - **`engine`**: A high-level module that simplifies swap operations by abstracting away DEX-specific details.
 - **`services`**: Provides an interface to external services, such as the Jito Block Engine, for enhanced transaction processing.
 
+```mermaid
+graph TD
+    subgraph "Application"
+        main["main.rs<br>Entry Point"]
+    end
+
+    subgraph "Core Logic"
+        engine["engine module<br>Swap Orchestration"]
+        dex["dex module<br>DEX-specific Logic<br>(Pump.fun, Raydium)"]
+        core["core module<br>Solana Transactions & Tokens"]
+    end
+
+    subgraph "Supporting Services"
+        services["services module<br>Jito Integration"]
+        common["common module<br>Shared Utilities<br>(RPC, Wallet, Logging)"]
+    end
+
+    main --> engine
+    main --> services
+    main --> common
+
+    engine --> dex
+    engine --> common
+
+    dex --> core
+    dex --> common
+
+    core --> services
+    core --> common
+
+    services --> common
+
+    style main fill:#cde,stroke:#333,stroke-width:2px
+    style common fill:#f9c,stroke:#333,stroke-width:2px
+```
+
 ---
 
 ## 🔄 **Workflow Diagram**
