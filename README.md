@@ -23,6 +23,42 @@ This project is organized into several distinct modules, each responsible for a 
 - **`engine`**: A high-level module that simplifies swap operations by abstracting away DEX-specific details.
 - **`services`**: Provides an interface to external services, such as the Jito Block Engine, for enhanced transaction processing.
 
+```mermaid
+graph TD
+    subgraph "Application"
+        main["main.rs<br>Entry Point"]
+    end
+
+    subgraph "Core Logic"
+        engine["engine module<br>Swap Orchestration"]
+        dex["dex module<br>DEX-specific Logic<br>(Pump.fun, Raydium)"]
+        core["core module<br>Solana Transactions & Tokens"]
+    end
+
+    subgraph "Supporting Services"
+        services["services module<br>Jito Integration"]
+        common["common module<br>Shared Utilities<br>(RPC, Wallet, Logging)"]
+    end
+
+    main --> engine
+    main --> services
+    main --> common
+
+    engine --> dex
+    engine --> common
+
+    dex --> core
+    dex --> common
+
+    core --> services
+    core --> common
+
+    services --> common
+
+    style main fill:#cde,stroke:#333,stroke-width:2px
+    style common fill:#f9c,stroke:#333,stroke-width:2px
+```
+
 ---
 
 ## 🔄 **Workflow Diagram**
@@ -31,32 +67,46 @@ The following diagram illustrates the end-to-end workflow of the Solana Copy Tra
 
 ```mermaid
 graph TD
-    subgraph "Real-time Monitoring"
-        helius_ws["Helius WebSocket"] --> tx_stream{"Transaction Stream"};
+    subgraph "Input"
+        helius_ws["Helius WebSocket<br>Transaction Stream"]
     end
 
-    subgraph "Trading Bot Core Logic"
-        tx_stream --> filter_wallet{"Filter for Target Wallet"};
-        filter_wallet -- "Transaction Found" --> parse_tx["Parse Transaction<br>(Buy/Sell, Mint, Amount)"];
-        filter_wallet -- "No Match" --> tx_stream;
+    subgraph "Bot Logic"
+        filter_wallet{"Filter & Parse Tx"}
+        helius_ws --> filter_wallet
     end
 
-    subgraph "DEX Interaction"
-        parse_tx --> determine_dex{"Determine DEX<br>(pump.fun or Raydium)"};
-        determine_dex -- "pump.fun" --> pump_module["Pump.fun Module<br>`dex/pump.rs`"];
-        determine_dex -- "Raydium" --> raydium_module["Raydium Module<br>`dex/raydium.rs`"];
-        pump_module --> build_instruction{"Build Swap Instruction"};
-        raydium_module --> build_instruction;
+    subgraph "Trade Execution"
+        determine_dex{"Select DEX"}
+        filter_wallet --> determine_dex
+
+        subgraph "Pump.fun"
+            pump_module["Build Pump.fun Swap"]
+        end
+        subgraph "Raydium"
+            raydium_module["Build Raydium Swap"]
+        end
+
+        determine_dex --> pump_module
+        determine_dex --> raydium_module
+
+        join_point(( ))
+        pump_module --> join_point
+        raydium_module --> join_point
     end
 
-    subgraph "Transaction Engine"
-        build_instruction --> tx_builder["Transaction Builder<br>`core/tx.rs`"];
-        tx_builder --> jito_service["Jito Service<br>`services/jito.rs`"];
+    subgraph "Transaction Submission"
+        tx_builder["Build & Sign Transaction<br>with Priority Fee"]
+        join_point --> tx_builder
+        jito_service["Submit to Jito<br>as Bundle"]
+        tx_builder --> jito_service
     end
 
-    subgraph "Solana Network"
-        jito_service --> jito_engine["Jito Block Engine"];
-        jito_engine --> tx_confirmation["Transaction Confirmation"];
+    subgraph "Confirmation"
+        jito_engine["Jito Block Engine"]
+        jito_service --> jito_engine
+        tx_confirmation["Transaction Confirmed"]
+        jito_engine --> tx_confirmation
     end
 
     style helius_ws fill:#f9f,stroke:#333,stroke-width:2px
